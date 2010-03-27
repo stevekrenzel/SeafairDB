@@ -1,8 +1,9 @@
+# -*- coding: utf-8 -*-
 # Seafair - A schemaless, persistent key-value store
 # Author: Steve Krenzel
 # License: MIT (See README for license details)
 
-from os.path import exists
+from os.path import exists, join
 from struct import pack, unpack, calcsize
 from hashlib import md5
 from simplejson import dumps, loads
@@ -10,12 +11,19 @@ from time import time
 from random import shuffle
 
 class Seafair:
+
+    data_path = "./data/"
+    fobj = None
+
     def __init__(self, filename):
+        # Set the filename to the data path
+        filename = join(Seafair.data_path, filename)
+
         # We use a larger sector to increase space efficiency
         self.sector = 512 * 4
 
         # This is the format for hash + address + length of data
-        self.entry_fmt = 'qqqq'
+        self.entry_fmt = 'QQQI'
         self.entry_sz = calcsize(self.entry_fmt)
         self.null_entry = pack(self.entry_fmt, 0, 0, 0, 0)
 
@@ -32,14 +40,12 @@ class Seafair:
 
     def init_ptrs(self):
         # Write 64 null pointers to the start of the file
-        self.fobj.seek(0)
-        self.fobj.write(pack('q' * 64, *([0] * 64)))
+        self.write(0, pack('Q' * 64, *([0] * 64)))
         self.read_ptrs()
 
     def add_table(self):
-        # Seek to the end of the file
-        self.fobj.seek(0, 2)
-        addr = self.fobj.tell()
+        # Get the end of the file
+        addr = self.get_eof()
 
         # Calculate the size of the new table, and allocate space for it
         size = (2**len(self.ptrs)) * self.sector
@@ -48,22 +54,20 @@ class Seafair:
 
         # Add our new address to the front of our ptr list and write it
         self.ptrs = [addr] + self.ptrs
-        self.write_ptrs()
+        self.write(0, pack('Q' * len(self.ptrs), *self.ptrs))
 
         # Update sizes and range
         self.update_sizes_and_ranges()
 
     def write_empty_space(self, byte_cnt):
-        # Seek to the end of the file
-        self.fobj.seek(0, 2)
-
-        # We write a megabyte at a time
-        # TODO: We might want to start with larger chunks
-        block_size = 1024 ** 2
+        # We write 4 megabytes at a time
+        block_size = 4 * 1024 * 1024
 
         # We create a block of null data
         zeroed_block  = chr(0) * block_size
 
+        # Seek to the end of the file
+        self.fobj.seek(0, 2)
         # Write the blocks to disk
         for i in xrange(byte_cnt / block_size):
             self.fobj.write(zeroed_block)
@@ -73,18 +77,12 @@ class Seafair:
         zeroed_block = chr(0) * (byte_cnt % block_size)
         self.fobj.write(zeroed_block)
 
-    def write_ptrs(self):
-        # We seek to the start of the file and write out our ptrs
-        self.fobj.seek(0)
-        self.fobj.write(pack('q' * len(self.ptrs), *self.ptrs))
-
     def read_ptrs(self):
-        # We seek to the start of the file and read in our ptrs
-        self.fobj.seek(0)
-        bytes = self.fobj.read(calcsize('q' * 64))
+        # We read in our ptrs
+        bytes = self.read(0, calcsize('Q' * 64))
 
         # Filter out any pointers that point to 0
-        self.ptrs = [i for i in unpack('q' * 64, bytes) if i > 0]
+        self.ptrs = [i for i in unpack('Q' * 64, bytes) if i > 0]
 
         # Update sizes and range
         self.update_sizes_and_ranges()
@@ -97,8 +95,6 @@ class Seafair:
         self.ranges =  map(r, self.sizes)
 
     def find_entry(self, entry, data):
-        # TODO Can we safely just do "return data.find(entry)" ? I think so
-        # TODO Cuckoo hashing?
         i = data.find(entry)
         while i != -1:
             if i % self.entry_sz == 0:
@@ -106,32 +102,29 @@ class Seafair:
             i = data.find(entry, i + 1)
         return None
 
-    def set(self, key_names, data):
+    def set(self, key_names, data, cls="", addr=None, size=None):
         # Grab the keys and hash them
-        # TODO make key a dict
-        # TODO We get knocked twice for the digest stuff... what can we do about this?
-        # TODO Can we minimize seeks and/or reads?
-        key  = md5("".join(str(data[i]) for i in sorted(key_names)))
+        # We append the class incase two models use the same key(s)
+        # TODO When you make the Data class, store an optional link to previous version?
+        key  = md5("".join(str(data[i]) for i in sorted(key_names)) + cls)
         hsh  = int(key.hexdigest(), 16)
         slot = hsh % self.ranges[0]
 
-        # Seek to EOF and get the address
-        self.fobj.seek(0,2)
-        addr = self.fobj.tell()
+        # If we already wrote this data, no need to write it again
+        if addr == None:
+            # Seek to EOF and get the address
+            addr = self.get_eof()
 
-        # Encode the data and store its size
-        json = dumps(data)
-        size = len(json)
+            # Encode the data and store its size
+            json = dumps(data)
+            size = len(json)
 
-        # Write the data to disk
-        self.fobj.write(json)
-
-        # Seek to the slot and find out where to save everything
-        start  = self.ptrs[0] + (slot * self.entry_sz)
-        self.fobj.seek(start)
+            # Write the data to disk
+            self.fobj.write(json)
 
         # Read in data to search
-        bytes = self.fobj.read(self.sector)
+        start  = self.ptrs[0] + (slot * self.entry_sz)
+        bytes = self.read(start, self.sector)
 
         # Find a place in the data to insert our key. First we see if the
         # key already exists, and if so simply overwrite it. Otherwise we
@@ -140,56 +133,95 @@ class Seafair:
         for b in [key_bytes, self.null_entry]:
             i = self.find_entry(b, bytes)
             if i != None:
-                self.fobj.seek(start + i)
-                self.fobj.write(key_bytes + pack('qq', addr, size))
+                self.write(start + i, key_bytes + pack('QI', addr, size))
                 break
         else:
             self.add_table()
-            self.set(key_names, data)
+            self.set(key_names, data, cls, addr, size)
 
-    def get(self, key):
+    def get(self, key, cls=""):
         # Grab the keys and hash them
-        key  = md5("".join(str(key[i]) for i in sorted(key.keys())))
+        key  = md5("".join(str(key[i]) for i in sorted(key.keys())) + cls)
         hsh  = int(key.hexdigest(), 16)
         key_bytes = key.digest()
         for i in xrange(len(self.ptrs)):
             slot = hsh % self.ranges[i]
 
-            # Seek to the slot and find out where to search
-            start  = self.ptrs[i] + (slot * self.entry_sz)
-            self.fobj.seek(start)
-
             # Read in data to search
-            bytes = self.fobj.read(self.sector)
+            start  = self.ptrs[i] + (slot * self.entry_sz)
+            bytes = self.read(start, self.sector)
 
             i = self.find_entry(key_bytes, bytes)
             if i != None:
                 h1, h2, addr, size = unpack(self.entry_fmt,
                                             bytes[i : i + self.entry_sz])
-                self.fobj.seek(addr)
-                return loads(self.fobj.read(size))
+                return loads(self.read(addr, size))
+
+    def write(self, addr, data):
+        self.fobj.seek(addr)
+        self.fobj.write(data)
+
+    def read(self, addr, size):
+        self.fobj.seek(addr)
+        return self.fobj.read(size)
+
+    def get_eof(self):
+        self.fobj.seek(0, 2)
+        return self.fobj.tell()
 
     def close(self):
         self.fobj.close()
 
-if __name__ == "__main__":
-    # TODO Try unicode
-    s = Seafair("test.sea")
-    r = range(50000)
-    shuffle(r)
-    t = time()
-    for i in r:
-        d = {"hello": i, "Goodbye": i}
-        s.set(["hello"], d)
-    print time() - t
-    s.close()
+class Data:
+    # TODO mulitple key groups?
 
-    s = Seafair("test.sea")
-    shuffle(r)
+    __db = None
+
+    def __init__(self, **kwargs):
+        if self.__class__.__db == None:
+            self.__class__.__db = Seafair(self.__class__.__name__ + ".sea")
+        self.__dict__.update(kwargs)
+        self.update_keys()
+
+    def update_keys(self):
+        c = self.__class__
+        c.__keys = [k for k, v in c.__dict__.items() if v == True]
+
+    @classmethod
+    def find(cls, **kwargs):
+        val = cls.__db.get(kwargs, cls.__name__)
+        if val:
+            return cls(**val)
+        return None
+
+    def save(self):
+        c = self.__class__
+        return c.__db.set(c.__keys, self.__dict__, c.__name__)
+
+    def __str__(self):
+        return unicode(self).encode('utf-8')
+
+    def __unicode__(self):
+        ret = "".encode('utf-8')
+        ret += u"%s:\n"%(self.__class__.__name__)
+        ret += u"\n".join(u"    %s: %s" % (k, v) for k, v in
+                sorted(self.__dict__.items(), lambda a, b: cmp(a[0], b[0])))
+        return unicode(ret + "\n")
+
+class Phonebook(Data):
+    name = True
+    phone = None
+
+if __name__ == "__main__":
+    o = 0
+    n = 300000
     t = time()
-    for i in r:
-        k = {"hello": i}
-        g = s.get(k)
-        if g["hello"] != i and g["Goodbye"] != i:
-            print "FU ", i
+    for i in xrange(o, n):
+        Phonebook(name=i, phone=i).save()
+    print time() - t
+    t = time()
+    for i in xrange(o, n):
+        p = Phonebook.find(name=i)
+        if not p:
+            print "UGH ", i
     print time() - t
