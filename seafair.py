@@ -30,7 +30,7 @@ class Seafair:
             makedirs(Seafair.data_path)
         filename = join(Seafair.data_path, filename)
         self.con = sqlite3.connect(filename)
-        self.con.execute("pragma synchronous = off")
+        self.con.execute("pragma synchronous = 0")
         self.con.execute("CREATE TABLE IF NOT EXISTS seafair (k PRIMARY KEY, v)")
 
     def set(self, key_names, data, cls=""):

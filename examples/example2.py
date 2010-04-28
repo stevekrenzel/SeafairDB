@@ -4,7 +4,7 @@ from time import time
 class CrazyList(Data):
     key = True
 
-n = 100000
+n = 2000000
 print "Printing existing values: "
 
 t = time()
