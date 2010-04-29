@@ -2,13 +2,6 @@
 # Seafair - A schemaless, persistent key-value store
 # Author: Steve Krenzel
 # License: MIT (See README for license details)
-# TODO Implement no_guarantee cache
-# TODO Implement app guarantee cache
-# TODO Implement os_guarantee cache
-# TODO Move to a single db file
-# TODO Create data_path if not exists
-# TODO Move to RESTful service
-# TODO Handle out of disk space errors
 
 import os
 import sqlite3
@@ -18,44 +11,64 @@ from os.path import exists, join
 from struct import pack, unpack, calcsize
 from hashlib import md5
 from simplejson import dumps, loads
-from time import time
 
+# Consistency constants
+NO_GUARANTEE = 0
+APP_GUARANTEE = 1
+OS_GUARANTEE = 2
 
 class Seafair:
 
     data_path = "./data/"
+    data_file = "seafair.sea"
+    con = None
+    consistency_level = APP_GUARANTEE
+    no_guarantee_delay = 100
 
-    def __init__(self, filename):
-        if not exists(Seafair.data_path):
-            makedirs(Seafair.data_path)
-        filename = join(Seafair.data_path, filename)
-        self.con = sqlite3.connect(filename)
-        self.con.execute("pragma synchronous = 0")
-        self.con.execute("CREATE TABLE IF NOT EXISTS seafair (k PRIMARY KEY, v)")
+    def __init__(self):
+        if Seafair.con == None:
+            if not exists(Seafair.data_path):
+                makedirs(Seafair.data_path)
+            filename = join(Seafair.data_path, Seafair.data_file)
+            Seafair.con = sqlite3.connect(filename)
+            if Seafair.consistency_level in [NO_GUARANTEE, APP_GUARANTEE]:
+                Seafair.con.execute("pragma synchronous = OFF")
+                Seafair.no_guarantee_count = Seafair.no_guarantee_delay
+            else:
+                Seafair.con.execute("pragma synchronous = FULL")
+            Seafair.con.execute("CREATE TABLE IF NOT EXISTS seafair (k PRIMARY KEY, v)")
 
     def set(self, key_names, data, cls=""):
+        # TODO Handle out of disk space errors
         # We append the class incase two models use the same key(s)
         key = md5("".join(str(data[i]) for i in sorted(key_names)) + cls)
         key_bytes = b64encode(key.digest())
         val_bytes = dumps(data)
-        self.con.execute("REPLACE INTO seafair VALUES (?, ?)",
-                         (key_bytes, val_bytes))
-        self.con.commit()
+        Seafair.con.execute("REPLACE INTO seafair VALUES (?, ?)",
+                            (key_bytes, val_bytes))
+        if Seafair.consistency_level == NO_GUARANTEE:
+            Seafair.no_guarantee_count -= 1
+            if Seafair.no_guarantee_count == 0:
+                Seafair.con.commit()
+                Seafair.no_guarantee_count = Seafair.no_guarantee_delay
+        else:
+            Seafair.con.commit()
         return True
-
 
     def get(self, key, cls=""):
         # Grab the keys and hash them
         key = md5("".join(str(key[i]) for i in sorted(key.keys())) + cls)
         key_bytes = b64encode(key.digest())
-        val_bytes = self.con.execute("SELECT v FROM seafair WHERE (k = ?)",
-                                     (key_bytes,)).fetchone()
+        val_bytes = Seafair.con.execute("SELECT v FROM seafair WHERE (k = ?)",
+                                        (key_bytes,)).fetchone()
         if val_bytes:
             return loads(val_bytes[0])
         return None
 
+    @classmethod
     def close(self):
-        self.con.close()
+        Seafair.con.commit()
+        Seafair.con.close()
 
 class Data:
     # TODO mulitple key groups?
@@ -64,7 +77,7 @@ class Data:
 
     def __init__(self, **kwargs):
         if self.__class__.__db == None:
-            self.__class__.__db = Seafair(self.__class__.__name__ + ".sea")
+            self.__class__.__db = Seafair()
             self.update_keys()
         self.__dict__.update(kwargs)
 
@@ -95,22 +108,3 @@ class Data:
         ret += u"\n".join(u"    %s: %s" % (k, v) for k, v in
                 sorted(self.__dict__.items(), lambda a, b: cmp(a[0], b[0])))
         return unicode(ret + "\n")
-
-class Twitter(Data):
-    name = True
-    tweet = None
-
-if __name__ == "__main__":
-    o = 0
-    n = 3000
-    t = time()
-    tweet = "2" * 140
-    for i in xrange(o, n):
-        Twitter(name=i, tweet=tweet).save()
-    print time() - t
-    t = time()
-    for i in xrange(o, n):
-        p = Twitter.find(name=i)
-        if not p or p.tweet != tweet or p.name != i:
-            print "UGH ", i
-    print time() - t

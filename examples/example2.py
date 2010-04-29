@@ -1,10 +1,12 @@
-from seafair import Data
+from seafair import *
 from time import time
+
+Seafair.consistency_level = NO_GUARANTEE
 
 class CrazyList(Data):
     key = True
 
-n = 2000000
+n = 10000
 print "Printing existing values: "
 
 t = time()
